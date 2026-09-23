@@ -2,9 +2,7 @@
 
 **A prototype risk-intelligence platform for network-based sanctions and financial crime screening, grounded in current enforcement cases.**
 
-> **Status:** 🚧 In development: Foundation phase
-> **Last updated:** 22 September 2026
->
+
 > This is an independent research and portfolio project. It is not affiliated with, endorsed by, or built on the proprietary data of any company. Nothing in this repository is legal advice or a legal determination under any sanctions regime.
 
 ---
@@ -312,4 +310,5 @@ TBD. Code license to be chosen; data remains subject to each source's own terms.
 
 ## Author
 
-*Your name · contact · LinkedIn*
+Subriti Pradhan
+https://github.com/subritii
