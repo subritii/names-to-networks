@@ -17,8 +17,9 @@ data/snapshots/
 # Jupyter
 .ipynb_checkpoints/
 
-# Internal docs (not published to GitHub)
-doc/
+# Internal docs and Claude skills (not published to GitHub)
+docs/
+.claude/
 
 # OS
 .DS_Store
