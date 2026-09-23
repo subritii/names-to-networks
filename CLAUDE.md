@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## The specs are binding — read before writing code
 
-`docs/specs/` contains four specs that are the single source of truth for their respective areas. They are deliberately excluded from the public GitHub repo (see `.gitignore`) but are always present locally and must be read in full before touching the corresponding code — do not re-derive this logic from intuition or from the README's simplified description, which the specs supersede with precise, edge-case-tested rules.
+`docs/specs/` contains four specs that are the single source of truth for their respective areas. They are tracked and public in the GitHub repo by design (portfolio evidence and version history — see "Docs and decisions" below) and must be read in full before touching the corresponding code — do not re-derive this logic from intuition or from the README's simplified description, which the specs supersede with precise, edge-case-tested rules.
 
 | Area | Spec | Governs |
 |---|---|---|
@@ -76,8 +76,8 @@ Pipeline, matching the README's flow (`src/ingest` → `src/resolve` → `src/gr
 
 ## Docs and decisions
 
-- `docs/specs/` — the four binding specs above (git-ignored, local-only).
-- `docs/decisions.md` — running log of interpretation/implementation decisions (git-ignored, local-only).
+- `docs/specs/` — the four binding specs above (tracked, public by design — see 2026-09-23 in `docs/decisions.md`).
+- `docs/decisions.md` — running log of interpretation/implementation decisions (tracked, public by design — same reasoning as `docs/specs/`).
 - `docs/context_log.md` and `docs/results/` — dated log of relevant news/regulatory events, and results write-ups/charts (tracked, public).
 
 ## Data and privacy

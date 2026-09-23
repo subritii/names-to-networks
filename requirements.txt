@@ -13,6 +13,7 @@ networkx
 
 # Testing
 pytest
+pytest-timeout
 hypothesis
 
 # Config & secrets
