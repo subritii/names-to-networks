@@ -1,0 +1,25 @@
+# Environment / secrets
+.env
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Data (raw/processed data is git-ignored per README; keep folder structure via .gitkeep if added later)
+data/raw/
+data/processed/
+data/snapshots/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
