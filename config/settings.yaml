@@ -1,0 +1,27 @@
+# Populated as the pipeline is built. See docs/specs/ for what each key governs.
+
+snapshot_dates:
+  opensanctions: null
+  companies_house: null
+  gleif: null
+
+seeds:
+  synthetic_generation: null
+  split_assignment: null
+
+eval:
+  equal_recall_target: 0.95        # evaluation.md §5b default
+  refresh_schedule: daily          # evaluation.md §5h default
+  test_set_hash: null              # evaluation.md §3.4
+  strata:                          # evaluation.md §2.1 defaults
+    direct_hit: 150
+    indirect_hit: 150
+    indirect_ambiguous: 50
+    decoy: 700
+    clean_control: 8950
+  source_entities:
+    tuning: []                     # evaluation.md §3.2
+    test: []
+
+agent_eval:
+  test_set_hash: null              # l1_agent.md §3.1

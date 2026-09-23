@@ -1,0 +1,23 @@
+# Data processing
+pandas
+polars
+
+# Data model / entity resolution
+followthemoney
+splink
+rapidfuzz
+unidecode
+
+# Graph
+networkx
+
+# Testing
+pytest
+hypothesis
+
+# Config & secrets
+pyyaml
+python-dotenv
+
+# Evaluation
+scikit-learn
