@@ -1,7 +1,7 @@
 # Ownership & Blocking Rules
 
-**Status:** complete (v0.9: `control_links`/`CONTROL_ONLY_LINK` now filtered to controllers that are BLOCKED or AMBIGUOUS (§9, §9.1); §4.4 gained the boundary-touching true-open/closed-bounds rule (§4.2's band table) for ranges whose stored numbers meet at exactly one point, with worked-example rows 29–31; row 32 added for a CLEAR-controller control edge; §9.1's `AGGREGATE_OWNERSHIP` now states explicitly that it presupposes `OWNED_BY_BLOCKED`; §7 now requires `propagate_blocked()` to raise a validation error on a null start date rather than treat it as inactive; v0.8: fixed §4.4's `unknown` uncertainty-kind condition — an overlap-combined edge is `unknown` only if *every* contributing source is unknown, not merely one; added worked-example rows 27–28; v0.7: added §9.1 explicit reason-code trigger conditions, §4.4 uncertainty-kind classification (`band`/`unknown`/`conflict`/`none`) and the same-source duplicate-edge rule; v0.6: added §5.2 — reported sums capped at 100, new `OWNERSHIP_OVER_100` reason code; v0.5: §11 item 1 scoped monotonicity to the combined edge after §4.4 conflict resolution; v0.4: `IdentityLinkEdge` made symmetric and given a `first_seen_date` with half-open time validity; v0.3: identity-link ambiguity path added, per `entity_linking.md` §2.4)
-**Governs:** `src/screen/ownership.py` (`propagate_blocked()`), `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`, `tests/test_ownership_reason_codes.py`
+**Status:** complete (v0.10: added §9.2 — evidence content, computed from fact IDs (§9.2.1) and a synchronous justification rank (§9.2.2), with per-status selection rules (§9.2.4), worked examples EV1–EV11 (§9.2.5), and required properties (§9.2.6); §9's `evidence_paths` placeholder replaced by the `evidence` field, now specified by §9.2; v0.9: `control_links`/`CONTROL_ONLY_LINK` now filtered to controllers that are BLOCKED or AMBIGUOUS (§9, §9.1); §4.4 gained the boundary-touching true-open/closed-bounds rule (§4.2's band table) for ranges whose stored numbers meet at exactly one point, with worked-example rows 29–31; row 32 added for a CLEAR-controller control edge; §9.1's `AGGREGATE_OWNERSHIP` now states explicitly that it presupposes `OWNED_BY_BLOCKED`; §7 now requires `propagate_blocked()` to raise a validation error on a null start date rather than treat it as inactive; v0.8: fixed §4.4's `unknown` uncertainty-kind condition — an overlap-combined edge is `unknown` only if *every* contributing source is unknown, not merely one; added worked-example rows 27–28; v0.7: added §9.1 explicit reason-code trigger conditions, §4.4 uncertainty-kind classification (`band`/`unknown`/`conflict`/`none`) and the same-source duplicate-edge rule; v0.6: added §5.2 — reported sums capped at 100, new `OWNERSHIP_OVER_100` reason code; v0.5: §11 item 1 scoped monotonicity to the combined edge after §4.4 conflict resolution; v0.4: `IdentityLinkEdge` made symmetric and given a `first_seen_date` with half-open time validity; v0.3: identity-link ambiguity path added, per `entity_linking.md` §2.4)
+**Governs:** `src/screen/ownership.py` (`propagate_blocked()`), `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`, `tests/test_ownership_reason_codes.py`, `tests/test_ownership_evidence.py`
 
 ## 1. Purpose
 
@@ -257,7 +257,7 @@ This number is a **risk feature and explanation field only** (e.g. "high effecti
 | `status` | BLOCKED, AMBIGUOUS, or CLEAR |
 | `blocked_owner_sum` | `(lower_sum, upper_sum_blocked)` from blocked owners only (§5), each component capped at 100 for reporting (§5.2) |
 | `possible_owner_sum` | `upper_sum` from blocked and ambiguous owners, capped at 100 (§5, §5.2) |
-| `evidence_paths` | For BLOCKED: each chain of blocked owners back to a designated entity, with stake range, source, and dates on every edge. For AMBIGUOUS: the chains that make the threshold reachable, plus any `IdentityLinkEdge` and the status of its target, for identity-linked ambiguity (§5.1). |
+| `evidence` | Why the entity has its status, using the fewest facts that decide it. See §9.2. |
 | `control_links` | Active `ControlEdge`s into the entity whose controller (`owner_id`) is BLOCKED or AMBIGUOUS in the final `blocked`/`possible` sets (evidence only) — same filter as reason code `CONTROL_ONLY_LINK` (§9.1); a control edge from a CLEAR controller produces no entry here |
 | `effective_ownership` | Feature from §8, per designated root |
 | `reason_codes` | See below |
@@ -284,6 +284,101 @@ Each entity's `reason_codes` is the union of every condition below that holds fo
 | `OWNERSHIP_OVER_100` | The uncapped sum of `stake_lower` across **all** active combined edges into the entity, regardless of owner status, exceeds 100 (§5.2). |
 
 `BAND_UNCERTAINTY`, `UNKNOWN_STAKE`, and `STAKE_CONFLICT` are mutually exclusive **per edge** (an edge's uncertainty kind is exactly one of `band`/`unknown`/`conflict`/`none`, §4.4), but a single entity can still carry more than one of these codes if it has multiple incoming edges of different kinds.
+
+### 9.2 Evidence
+
+**Governs:** the `evidence` field of each `propagate_blocked()` result (replaces the `evidence_paths` placeholder in §9). Effective ownership (§8) remains separate and out of scope for this section.
+
+Evidence explains **why an entity has its status**, using the fewest facts that decide it. It does not list every ownership path: in dense or cyclic graphs that set can grow without bound, and most paths play no part in the decision.
+
+#### 9.2.1 Fact IDs
+
+Every input fact has a stable, content-derived ID, computed from the fact's fields alone:
+
+| Fact type | ID format |
+|---|---|
+| Designation | `des:<entity_id>:<designation_start>:<h8>` |
+| Ownership edge | `own:<source>:<owner_id>:<owned_id>:<start_date>:<h8>` |
+| Identity link | `idl:<id_a>:<id_b>:<first_seen_date>:<h8>`, with `id_a`, `id_b` sorted (the link is unordered, §2) |
+| Control edge | `ctl:<source>:<owner_id>:<owned_id>:<start_date>:<h8>` |
+
+`<h8>` is the first 8 hex characters of the SHA-256 of all the fact's fields in a fixed order. It guarantees distinct facts get distinct IDs, including same-source duplicates (§4.4). The same fact always gets the same ID, on every run and in any input order.
+
+#### 9.2.2 Justification rank
+
+Each BLOCKED or AMBIGUOUS entity has a **rank**: the step at which it first entered its final status, computed with **synchronous** passes (every entity's status in step *k* is computed from the statuses at the end of step *k − 1*). Ranks are therefore independent of processing order.
+
+- Designated entities: blocked-rank 0.
+- BLOCKED entities: blocked-rank = the step at which they entered `blocked`.
+- AMBIGUOUS entities: ambiguous-rank = the step at which they entered `possible`.
+
+Ranks exist to make evidence acyclic by construction (§9.2.4), including when ownership forms a cycle. The implementation may compute statuses however it likes, but ranks must match the synchronous definition.
+
+#### 9.2.3 Evidence content
+
+```
+Evidence:
+  entity_id
+  status            BLOCKED | AMBIGUOUS | CLEAR
+  kind              DESIGNATED | OWNERSHIP | IDENTITY_LINK | NONE
+  rank              int, or null for CLEAR
+  fact_ids          list of fact IDs cited directly by this evidence
+  steps             list of EvidenceStep
+  depends_on        list of entity IDs whose evidence this evidence references
+
+EvidenceStep:
+  owner_id          the owner (or identity-link partner) cited
+  owner_status      BLOCKED | AMBIGUOUS (final status)
+  stake_range       (lower, upper) of the combined edge (§4.4); null for identity links
+  uncertainty_kind  none | band | unknown | conflict (§4.4); null for identity links
+  source_fact_ids   ALL source fact IDs combined into this edge (§4.4), or the link's fact ID
+```
+
+Evidence **references** each owner's own evidence through `depends_on`; it never copies the owner's chain. A helper `explain(entity_id)` may expand references into a full chain for display; that expansion is derived, not stored.
+
+#### 9.2.4 Selection rules
+
+**Designated.** `kind = DESIGNATED`, `rank = 0`, `fact_ids` = the designation fact only, `steps` empty. This applies even if the entity is also owned by blocked owners.
+
+**BLOCKED (not designated).** `kind = OWNERSHIP`. Eligible owners: BLOCKED owners with a **smaller blocked-rank** than this entity. Sort eligible steps by `stake_range.lower` descending, then `owner_id` ascending, then smallest source fact ID. Take steps in that order until the running sum of lower bounds reaches 50. This cites the fewest owners that decide the outcome.
+
+**AMBIGUOUS.** Eligible contributors: BLOCKED owners (any rank), and AMBIGUOUS owners or identity-link partners with a **smaller ambiguous-rank** than this entity.
+- If eligible ownership steps can reach an upper-bound sum of 50: `kind = OWNERSHIP`. Sort by `stake_range.upper` descending, then `owner_id`, then smallest source fact ID, and take steps until the upper-bound sum reaches 50.
+- Otherwise: `kind = IDENTITY_LINK`. Cite the eligible identity link with the smallest fact ID, with the partner as the step's `owner_id`.
+
+**CLEAR.** `kind = NONE`, `rank = null`, `fact_ids`, `steps`, and `depends_on` empty.
+
+**Every step cites all source facts of its combined edge** (§4.4), never a subset. Citing one source of a conflict would change the combined range, and with it the status.
+
+#### 9.2.5 Worked examples
+
+D, D1, D2 are designated. All facts active unless stated. Each row is a required unit test.
+
+| # | Setup | Expected evidence |
+|---|---|---|
+| EV1 | D designated | D: `DESIGNATED`, rank 0, fact_ids = [D's designation], no steps |
+| EV2 | D owns 60% of A; A owns 50% of B (the §3 cascade) | A: rank 1, one step (D, [60,60]). B: rank 2, one step (A, [50,50]), depends_on [A]. B does **not** cite D directly. |
+| EV3 | D1 owns 25%, D2 owns 25% of A | A: two steps (D1 and D2), since neither alone reaches 50 |
+| EV4 | D1 owns 60%, D2 owns 10% of A | A: one step (D1) only; D2 is not needed |
+| EV5 | D1 owns 60%, D2 owns 60% of A | A: one step, D1 (tie broken by `owner_id`) |
+| EV6 | D owns Band A of X | X: AMBIGUOUS, `OWNERSHIP`, one step (D, [25,50], kind band) |
+| EV7 | D owns Band A of X; X owns 100% of Y | Y: AMBIGUOUS, one step (X, owner_status AMBIGUOUS), depends_on [X]; X's rank < Y's rank |
+| EV8 | D owns 60% of A; A owns 60% of B; B owns 60% of A (cycle) | A: rank 1, cites D. B: rank 2, cites A. A's evidence never cites B. |
+| EV9 | Source 1: D owns 60% of X; source 2: D owns 30% of X | X: AMBIGUOUS, one step, range [30,60], kind conflict, source_fact_ids = **both** source facts |
+| EV10 | E linked to designated D, no ownership edges | E: AMBIGUOUS, `IDENTITY_LINK`, one step (owner D), source_fact_ids = [the link's fact ID], depends_on [D] |
+| EV11 | Entity with no risk | `NONE`, rank null, everything empty |
+
+#### 9.2.6 Required properties
+
+Property tests, over the same generated graphs as §11:
+
+1. **Sufficiency.** For every BLOCKED or AMBIGUOUS entity *x*, collect the facts cited by *x*'s evidence and, recursively, by every entity in its `depends_on` closure. Running `propagate_blocked()` on only those facts, at the same `as_of_date`, gives *x* the **same status**.
+2. **Necessity (BLOCKED).** For every non-designated BLOCKED entity, removing any single step drops the sum of cited lower bounds below 50.
+3. **Valid citations.** Every cited fact ID exists in the input and is active at `as_of_date`.
+4. **Acyclic.** The `depends_on` graph contains no cycle (shared dependencies, i.e. diamonds, are allowed). BLOCKED evidence cites only BLOCKED owners of smaller blocked-rank; AMBIGUOUS evidence cites BLOCKED owners, or AMBIGUOUS contributors of smaller ambiguous-rank. Every chain ends at a designation.
+5. **Designated and CLEAR.** Designated entities have exactly their designation fact; CLEAR entities have empty evidence.
+6. **Order independence.** Shuffling input order never changes any evidence, including fact IDs, step order, and ranks.
+7. **Fact ID stability.** The same fact always gets the same ID; distinct facts always get distinct IDs.
 
 ## 10. Non-goals (out of scope for this version)
 

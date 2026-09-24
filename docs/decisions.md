@@ -389,6 +389,98 @@ were not touched; new tests went into `tests/test_ownership_reason_codes.py`, wh
 All 70 tests pass, including a full run on the `ci` Hypothesis profile
 (`HYPOTHESIS_PROFILE=ci pytest tests/ -q`, 1000 examples per property test).
 
+## 2026-09-24 — §9.2 (evidence) added to `ownership_rules.md`; `evidence_paths` replaced by `evidence`
+
+At the user's direction, folded `evidence_section.md` (drafted separately) into `ownership_rules.md` as new
+§9.2, and updated §9's output table so its `evidence` field now points to §9.2 instead of the old
+`evidence_paths` placeholder description. Bumped the spec to v0.10 and added `tests/test_ownership_evidence.py`
+to the spec's `Governs` line (new file, not yet written at the time of this entry).
+
+This is a source-of-truth promotion, not a new rule invented here: §9.2's content (fact IDs, synchronous
+justification rank, evidence-content schema, per-status selection rules, worked examples EV1–EV11, and
+seven required properties) was supplied verbatim by the user via `evidence_section.md`; no interpretation
+was added at this step. `src/screen/ownership.py`'s `OwnershipResult.evidence_paths` field, and its doc
+comment listing `evidence_paths`/`effective_ownership` as deferred placeholders, still need renaming to
+`evidence` as part of implementing §9.2 — tracked as the next step (tests first, then a plan-mode design
+note on rank/fact-ID computation, then implementation), not done in this spec-and-decisions-only step.
+
+## 2026-09-24 — §9.2 evidence implemented: fact-ID hash recipe, synchronous ranks
+
+Implemented `docs/specs/ownership_rules.md` §9.2 in `src/screen/ownership.py`, following the
+plan-mode design presented and approved before any code was written (per the ownership-rules
+skill's "present a plan" rule and the user's explicit instruction to explain fact-ID/rank
+computation in plan mode first). All 18 new tests (`tests/test_ownership_evidence.py`'s
+EV1–EV11, plus 7 property tests for §9.2.6 appended to `tests/test_ownership_properties.py`)
+were written and confirmed failing before this implementation; all 88 tests
+(70 pre-existing + 18 new) pass afterward, on both the `dev` and `ci` Hypothesis profiles.
+Neither `tests/test_ownership_examples.py` nor `tests/test_ownership_reason_codes.py` was
+touched; no existing assertion in any file was modified.
+
+Two scaffolding decisions the spec leaves to the implementation (not rule interpretations —
+same category as the `ControlEdge` dataclass decision above):
+
+1. **Fact-ID hash recipe.** Each fact type's ID is `<prefix>:<visible fields>:<h8>`, where
+   `h8` is the first 8 hex chars of `sha256` over *all* the fact's fields (not just the
+   visible ones) joined by `|`. Field order per type: designation —
+   `(entity_id, designation_start, designation_end)`; ownership edge — `(owner_id, owned_id,
+   stake_lower, stake_upper, stake_known, source, start_date, end_date, start_date_inferred)`;
+   identity link — `(id_a, id_b, first_seen_date)` with `id_a`/`id_b` sorted first (the edge
+   is unordered, §2); control edge — `(owner_id, owned_id, source, start_date, end_date)`.
+   Hashing every field (not just the ones shown in the visible prefix) is what makes two
+   same-source, same-pair, same-start-date edges that differ only in stake or end date get
+   different IDs, per §9.2.1's "including same-source duplicates" requirement.
+
+2. **Synchronous ranks computed by a separate pass, not the existing async loop.** The
+   existing fixed-point loop in `propagate_blocked()` is asynchronous (Gauss-Seidel: within
+   one pass, an update to entity A is visible to entity B examined later in the *same* pass)
+   and is already correct and tested — left untouched. Added `_synchronous_ranks()`, a
+   self-contained Jacobi-style pass that only ever reads the *previous* round's frozen
+   `blocked`/`possible` sets, seeded from a copy of the designation set taken before the
+   existing loop mutates it in place (`designated_seed = set(blocked)`, one added line).
+   Relies on the standard fixed-point-theory fact that a monotone update function's least
+   fixed point above a given seed doesn't depend on synchronous-vs-asynchronous scheduling as
+   long as every entity is re-examined every round (true of both loops here) — so
+   `_synchronous_ranks()`'s `blocked_rank`/`possible_rank` key sets always agree with the
+   main loop's `blocked`/`possible`, without the two being reconciled in code. Verified by
+   the full property-test suite (in particular `test_evidence_property_1_sufficiency` and
+   `test_evidence_property_4_acyclic`, which would fail immediately on any disagreement).
+
+One test-writing bug found and fixed while turning the new tests green (not a code bug):
+`test_evidence_property_4_acyclic`'s first version treated *any* second visit to an entity
+during the `depends_on` walk as a cycle, which incorrectly flags a legitimate diamond
+dependency (two different entities both citing the same lower-ranked owner — e.g. two
+BLOCKED entities both citing the same designated root) as acyclic-property violation. Fixed
+by tracking the current DFS path separately from the set of everything ever visited (a real
+cycle is a back-edge to an ancestor still on the current path; revisiting a node via a
+different, non-overlapping path is fine and expected). This is a fix to a test authored this
+session, not a change to any of the four pre-existing test files.
+
+`_combine_ownership_edges()` gained one additive key, `source_edges` (the raw list of
+contributing edges per pair, already grouped internally as `by_pair`) — used to build each
+`EvidenceStep.source_fact_ids`; the four keys existing code already reads are untouched.
+`EvidenceStep.source_fact_ids` is sorted before being stored, since the spec assigns no
+meaning to the list's order and leaving it in raw input order made
+`test_evidence_property_6_order_independence` fail (shuffling duplicate-pair source edges
+changed the list's order without changing its contents).
+
+## 2026-09-24 — §9.2.6 item 4 (acyclic) reworded: diamonds explicitly allowed
+
+At the user's direction, corrected `ownership_rules.md` §9.2.6 item 4's wording from "Following
+`depends_on` never revisits an entity" to "The `depends_on` graph contains no cycle (shared
+dependencies, i.e. diamonds, are allowed)."
+
+The original wording was ambiguous in a way that had already caused a real bug: the first
+version of `test_evidence_property_4_acyclic` (see the "§9.2 evidence implemented" entry
+above) read "never revisits an entity" literally and flagged any second visit to an entity
+during the `depends_on` walk as a violation — including a legitimate diamond, where two
+different entities both cite the same lower-ranked owner (e.g. two BLOCKED entities both
+citing the same designated root). That is not a cycle and must be allowed; the actual
+required property is that the graph has no back-edge to an ancestor still on the current
+path. The test was already fixed to check that correctly (tracking the current DFS path
+separately from the set of everything ever visited); this entry corrects the spec prose itself
+to match the property actually being enforced, rather than the case that produced the earlier
+false positive.
+
 ## 2026-09-23 — `IdentityLinkEdge` gets a `first_seen_date`, filtered like any other edge
 
 Spec change (v0.4) to `ownership_rules.md` §2, at the user's direction: `IdentityLinkEdge` now carries a

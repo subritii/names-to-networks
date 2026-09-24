@@ -24,6 +24,9 @@ from src.screen.ownership import (
     Entity,
     IdentityLinkEdge,
     OwnershipEdge,
+    designation_fact_id,
+    identity_link_fact_id,
+    ownership_fact_id,
     propagate_blocked,
 )
 
@@ -724,3 +727,218 @@ def test_property_13_general_time_consistency(graph):
 
     for eid in {e.id for e in graph.entities}:
         assert result_before[eid].status == result_after[eid].status
+
+
+# --- §9.2.6 evidence property tests -----------------------------------------
+#
+# propagate_blocked() does not compute real evidence yet (evidence is always
+# None, and the fact-ID helpers raise NotImplementedError), so every test
+# below is expected to fail until §9.2 is implemented. Added at the user's
+# direction, per docs/decisions.md (2026-09-24); reuses the graphs() strategy
+# above. Do not weaken these to make code pass.
+
+
+def _collect_cited(evidence_by_id, entity_id, seen=None):
+    """Recursively collect the fact IDs and entity IDs cited by entity_id's
+    evidence and, transitively, by every entity in its depends_on closure
+    (§9.2.6 item 1, sufficiency)."""
+    if seen is None:
+        seen = set()
+    if entity_id in seen:
+        return set(), set()
+    seen.add(entity_id)
+    ev = evidence_by_id[entity_id]
+    fact_ids = set(ev.fact_ids)
+    for step in ev.steps:
+        fact_ids.update(step.source_fact_ids)
+    entity_ids = {entity_id}
+    for dep in ev.depends_on:
+        sub_facts, sub_entities = _collect_cited(evidence_by_id, dep, seen)
+        fact_ids |= sub_facts
+        entity_ids |= sub_entities
+    return fact_ids, entity_ids
+
+
+def _minimal_graph(graph, fact_ids, entity_ids):
+    """The graph reduced to only entity_ids, with each entity's designation
+    kept only if its own designation fact is in fact_ids, and only the
+    ownership edges / identity links whose fact ID is in fact_ids (§9.2.6
+    item 1). Control edges are omitted -- they never affect status (§10)."""
+    entities = []
+    for e in graph.entities:
+        if e.id not in entity_ids:
+            continue
+        if e.designated and designation_fact_id(e) in fact_ids:
+            entities.append(e)
+        else:
+            entities.append(
+                replace(e, designated=False, designation_start=None, designation_end=None)
+            )
+    edges = [e for e in graph.ownership_edges if ownership_fact_id(e) in fact_ids]
+    links = [l for l in graph.identity_link_edges if identity_link_fact_id(l) in fact_ids]
+    return Graph(entities, edges, links, [], graph.as_of_date)
+
+
+@given(graph=graphs())
+def test_evidence_property_1_sufficiency(graph):
+    result = _run(graph)
+    evidence_by_id = {eid: r.evidence for eid, r in result.items()}
+
+    for eid, r in result.items():
+        if r.status == "CLEAR":
+            continue
+        fact_ids, entity_ids = _collect_cited(evidence_by_id, eid)
+        minimal = _minimal_graph(graph, fact_ids, entity_ids)
+        minimal_result = _run(minimal)
+        assert minimal_result[eid].status == r.status
+
+
+@given(graph=graphs())
+def test_evidence_property_2_necessity_blocked(graph):
+    result = _run(graph)
+    for eid, r in result.items():
+        ev = r.evidence
+        if r.status != "BLOCKED" or ev.kind != "OWNERSHIP":
+            continue
+        lowers = [s.stake_range[0] for s in ev.steps]
+        total = sum(lowers)
+        assert total >= 50
+        for i in range(len(lowers)):
+            assert total - lowers[i] < 50
+
+
+@given(graph=graphs())
+def test_evidence_property_3_valid_citations(graph):
+    active_ownership_ids = {
+        ownership_fact_id(e)
+        for e in graph.ownership_edges
+        if e.start_date <= graph.as_of_date
+        and (e.end_date is None or graph.as_of_date < e.end_date)
+    }
+    active_link_ids = {
+        identity_link_fact_id(link)
+        for link in graph.identity_link_edges
+        if link.first_seen_date <= graph.as_of_date
+    }
+    active_designation_ids = {
+        designation_fact_id(e)
+        for e in graph.entities
+        if e.designated
+        and e.designation_start <= graph.as_of_date
+        and (e.designation_end is None or graph.as_of_date < e.designation_end)
+    }
+    all_active_ids = active_ownership_ids | active_link_ids | active_designation_ids
+
+    result = _run(graph)
+    for r in result.values():
+        ev = r.evidence
+        cited = set(ev.fact_ids)
+        for step in ev.steps:
+            cited.update(step.source_fact_ids)
+        assert cited <= all_active_ids
+
+
+def _walk_acyclic(evidence_by_id, result, entity_id, on_path, visited):
+    """DFS from entity_id through depends_on, asserting no cycle (a real
+    cycle is a back-edge to an ancestor still `on_path` -- a diamond, where
+    two different entities both cite the same lower-ranked owner, is fine
+    and must not be flagged: that's why this tracks the current path
+    separately from the set of everything visited so far, rather than
+    forbidding a second visit outright)."""
+    assert entity_id not in on_path
+    if entity_id in visited:
+        return
+    visited.add(entity_id)
+    on_path.add(entity_id)
+    ev = evidence_by_id[entity_id]
+    if ev.kind != "DESIGNATED":
+        for dep in ev.depends_on:
+            dep_status = result[dep].status
+            assert dep_status in ("BLOCKED", "AMBIGUOUS")
+            if ev.status == "BLOCKED":
+                assert dep_status == "BLOCKED"
+                assert evidence_by_id[dep].rank < ev.rank
+            elif dep_status == "AMBIGUOUS":
+                assert evidence_by_id[dep].rank < ev.rank
+            _walk_acyclic(evidence_by_id, result, dep, on_path, visited)
+    on_path.discard(entity_id)
+
+
+@given(graph=graphs())
+def test_evidence_property_4_acyclic(graph):
+    result = _run(graph)
+    evidence_by_id = {eid: r.evidence for eid, r in result.items()}
+
+    for eid, r in result.items():
+        if r.status == "CLEAR":
+            continue
+        visited = set()
+        _walk_acyclic(evidence_by_id, result, eid, set(), visited)
+        assert any(evidence_by_id[x].kind == "DESIGNATED" for x in visited)
+
+
+@given(graph=graphs())
+def test_evidence_property_5_designated_and_clear(graph):
+    result = _run(graph)
+    for e in graph.entities:
+        r = result[e.id]
+        ev = r.evidence
+        if r.status == "BLOCKED" and ev.kind == "DESIGNATED":
+            assert ev.fact_ids == [designation_fact_id(e)]
+            assert ev.steps == []
+        if r.status == "CLEAR":
+            assert ev.kind == "NONE"
+            assert ev.rank is None
+            assert ev.fact_ids == []
+            assert ev.steps == []
+            assert ev.depends_on == []
+
+
+@given(data=st.data())
+def test_evidence_property_6_order_independence(data):
+    graph = data.draw(graphs())
+    shuffled = Graph(
+        list(data.draw(st.permutations(graph.entities))),
+        list(data.draw(st.permutations(graph.ownership_edges))),
+        list(data.draw(st.permutations(graph.identity_link_edges))),
+        list(data.draw(st.permutations(graph.control_edges))),
+        graph.as_of_date,
+    )
+    result_a = _run(graph)
+    result_b = _run(shuffled)
+
+    for eid in {e.id for e in graph.entities}:
+        ev_a, ev_b = result_a[eid].evidence, result_b[eid].evidence
+        assert ev_a.rank == ev_b.rank
+        assert ev_a.kind == ev_b.kind
+        assert ev_a.fact_ids == ev_b.fact_ids
+        assert ev_a.depends_on == ev_b.depends_on
+        steps_a = [(s.owner_id, s.stake_range, tuple(s.source_fact_ids)) for s in ev_a.steps]
+        steps_b = [(s.owner_id, s.stake_range, tuple(s.source_fact_ids)) for s in ev_b.steps]
+        assert steps_a == steps_b
+
+
+@given(graph=graphs())
+def test_evidence_property_7_fact_id_stability(graph):
+    for e in graph.entities:
+        if e.designated:
+            assert designation_fact_id(e) == designation_fact_id(e)
+    for e in graph.ownership_edges:
+        assert ownership_fact_id(e) == ownership_fact_id(e)
+    for link in graph.identity_link_edges:
+        assert identity_link_fact_id(link) == identity_link_fact_id(link)
+
+    # Distinct facts get distinct IDs: any two ownership edges that differ in
+    # any field must get different fact IDs.
+    edge_keys = [
+        (
+            e.owner_id, e.owned_id, e.stake_lower, e.stake_upper, e.stake_known,
+            e.source, e.start_date, e.end_date, e.start_date_inferred,
+        )
+        for e in graph.ownership_edges
+    ]
+    edge_ids = [ownership_fact_id(e) for e in graph.ownership_edges]
+    for i in range(len(edge_keys)):
+        for j in range(i + 1, len(edge_keys)):
+            if edge_keys[i] != edge_keys[j]:
+                assert edge_ids[i] != edge_ids[j]

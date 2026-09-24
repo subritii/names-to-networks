@@ -1,10 +1,11 @@
 """Ownership-based blocking (BLOCKED/AMBIGUOUS/CLEAR) per docs/specs/ownership_rules.md.
 
-Implements statuses, reason codes, and capped reported sums (spec §5, §5.1,
-§5.2, §7, §9). `evidence_paths` and `effective_ownership` (§8) are left as
-empty placeholders -- they get their own implementation and tests later.
+Implements statuses, reason codes, capped reported sums, and evidence (spec
+§5, §5.1, §5.2, §7, §9, §9.2). `effective_ownership` (§8) is left as an empty
+placeholder -- it gets its own implementation and tests later.
 """
 
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
@@ -64,11 +65,81 @@ class ControlEdge:
 
 
 @dataclass
+class EvidenceStep:
+    """One cited owner/identity-link-partner within an Evidence (spec §9.2.3)."""
+    owner_id: str
+    owner_status: str  # "BLOCKED" | "AMBIGUOUS"
+    stake_range: Optional[tuple]  # (lower, upper) of the combined edge; None for identity links
+    uncertainty_kind: Optional[str]  # none | band | unknown | conflict (§4.4); None for identity links
+    source_fact_ids: list = field(default_factory=list)
+
+
+@dataclass
+class Evidence:
+    """Why an entity has its status, using the fewest facts that decide it
+    (spec §9.2). Not yet computed by propagate_blocked() -- see module
+    docstring and designation_fact_id()/ownership_fact_id()/
+    identity_link_fact_id()/control_fact_id() below.
+    """
+    entity_id: str
+    status: str  # "BLOCKED" | "AMBIGUOUS" | "CLEAR"
+    kind: str  # "DESIGNATED" | "OWNERSHIP" | "IDENTITY_LINK" | "NONE"
+    rank: Optional[int]  # None for CLEAR
+    fact_ids: list = field(default_factory=list)
+    steps: list = field(default_factory=list)  # list[EvidenceStep]
+    depends_on: list = field(default_factory=list)  # list[entity_id]
+
+
+def _fact_hash(*parts):
+    """First 8 hex chars of the SHA-256 of a fact's fields, in a fixed order
+    (spec §9.2.1). A pure function of the fields given -- the same fact
+    always hashes the same, and two facts differing in any field hash
+    differently (up to hash collision, which SHA-256 makes negligible).
+    """
+    material = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
+
+
+def designation_fact_id(entity):
+    """Stable, content-derived ID for a designation fact (spec §9.2.1)."""
+    h8 = _fact_hash(entity.id, entity.designation_start, entity.designation_end)
+    return f"des:{entity.id}:{entity.designation_start}:{h8}"
+
+
+def ownership_fact_id(edge):
+    """Stable, content-derived ID for an OwnershipEdge fact (spec §9.2.1)."""
+    h8 = _fact_hash(
+        edge.owner_id, edge.owned_id, edge.stake_lower, edge.stake_upper,
+        edge.stake_known, edge.source, edge.start_date, edge.end_date,
+        edge.start_date_inferred,
+    )
+    return f"own:{edge.source}:{edge.owner_id}:{edge.owned_id}:{edge.start_date}:{h8}"
+
+
+def identity_link_fact_id(link):
+    """Stable, content-derived ID for an IdentityLinkEdge fact (spec §9.2.1).
+
+    The link is unordered (spec §2), so entity_id/same_as_id are sorted
+    before hashing -- the same link stored with its fields swapped gets the
+    same fact ID.
+    """
+    id_a, id_b = sorted((link.entity_id, link.same_as_id))
+    h8 = _fact_hash(id_a, id_b, link.first_seen_date)
+    return f"idl:{id_a}:{id_b}:{link.first_seen_date}:{h8}"
+
+
+def control_fact_id(edge):
+    """Stable, content-derived ID for a ControlEdge fact (spec §9.2.1)."""
+    h8 = _fact_hash(edge.owner_id, edge.owned_id, edge.source, edge.start_date, edge.end_date)
+    return f"ctl:{edge.source}:{edge.owner_id}:{edge.owned_id}:{edge.start_date}:{h8}"
+
+
+@dataclass
 class OwnershipResult:
     status: str  # "BLOCKED" | "AMBIGUOUS" | "CLEAR"
     blocked_owner_sum: tuple  # (lower_sum, upper_sum) from blocked owners only
     possible_owner_sum: float  # upper_sum from blocked and ambiguous owners
-    evidence_paths: list = field(default_factory=list)
+    evidence: Optional[Evidence] = None
     control_links: list = field(default_factory=list)
     effective_ownership: dict = field(default_factory=dict)
     reason_codes: list = field(default_factory=list)
@@ -192,8 +263,171 @@ def _combine_ownership_edges(active_edges):
             "conflict": conflict,
             "kind": kind,
             "start_date_inferred": start_date_inferred,
+            "source_edges": edges,  # all raw edges combined (§9.2.4: cited in full, never a subset)
         }
     return combined
+
+
+def _synchronous_ranks(ids, designated_seed, incoming, identity_neighbors):
+    """Synchronous justification rank per spec §9.2.2: every entity's status
+    in pass k is computed from the statuses at the end of pass k-1 (unlike
+    propagate_blocked()'s own asynchronous fixed-point loop, where updates
+    within one pass are visible to later entities in the same pass). A
+    monotone update function's least fixed point above a given seed doesn't
+    depend on synchronous vs. asynchronous scheduling as long as every
+    entity is re-examined every pass, so this always agrees with
+    propagate_blocked()'s own blocked/possible sets (docs/decisions.md,
+    2026-09-24) -- it exists only to give each entity a rank, not to
+    recompute status.
+
+    Mirrors §5's per-entity check order (blocked test, unconditionally --
+    even for an entity already in `possible`, matching §5's own
+    unconditional `if lower_sum >= 50`; then possible via ownership; then
+    possible via identity link), but reads only blocked_so_far/possible_so_far
+    as they stood at the end of the previous pass.
+    """
+    blocked_rank = {eid: 0 for eid in designated_seed}
+    possible_rank = {}
+    blocked_so_far = set(designated_seed)
+    possible_so_far = set()
+
+    step = 0
+    while True:
+        step += 1
+        new_blocked = set()
+        new_possible = set()
+        for eid in ids:
+            if eid in blocked_so_far:
+                continue
+
+            edges_in = incoming.get(eid, [])
+            lower_sum = sum(info["lower"] for owner, info in edges_in if owner in blocked_so_far)
+            if lower_sum >= 50:
+                new_blocked.add(eid)
+                continue
+
+            if eid in possible_so_far:
+                continue
+
+            upper_sum = min(
+                100,
+                sum(
+                    info["upper"] for owner, info in edges_in
+                    if owner in blocked_so_far or owner in possible_so_far
+                ),
+            )
+            if upper_sum >= 50:
+                new_possible.add(eid)
+                continue
+
+            if any(
+                d in blocked_so_far or d in possible_so_far
+                for d in identity_neighbors.get(eid, ())
+            ):
+                new_possible.add(eid)
+
+        if not new_blocked and not new_possible:
+            break
+
+        for eid in new_blocked:
+            blocked_rank[eid] = step
+        blocked_so_far |= new_blocked
+        for eid in new_possible:
+            possible_rank[eid] = step
+        possible_so_far |= new_possible
+
+    return blocked_rank, possible_rank
+
+
+def _ownership_step(owner_id, info, blocked):
+    """One EvidenceStep for an ownership contributor (spec §9.2.3)."""
+    return EvidenceStep(
+        owner_id=owner_id,
+        owner_status="BLOCKED" if owner_id in blocked else "AMBIGUOUS",
+        stake_range=(info["lower"], info["upper"]),
+        uncertainty_kind=info["kind"],
+        # Sorted so the list's order doesn't depend on the input order of
+        # duplicate-pair source edges (spec §9.2.6 item 6, order independence).
+        source_fact_ids=sorted(ownership_fact_id(e) for e in info["source_edges"]),
+    )
+
+
+def _take_prefix_until_50(steps, bound_index):
+    """Sorted eligible steps -> the prefix whose running sum of
+    stake_range[bound_index] first reaches 50 (spec §9.2.4's greedy
+    selection, shared by the BLOCKED and AMBIGUOUS/OWNERSHIP rules).
+    """
+    taken = []
+    running = 0
+    for step in steps:
+        if running >= 50:
+            break
+        taken.append(step)
+        running += step.stake_range[bound_index]
+    return taken
+
+
+def _build_evidence(eid, entity, status, designated_active, edges_in, identity_links,
+                     blocked, possible, blocked_rank, possible_rank):
+    """Evidence for one entity's status, per spec §9.2.3-§9.2.4."""
+    if designated_active:
+        return Evidence(
+            entity_id=eid, status=status, kind="DESIGNATED", rank=0,
+            fact_ids=[designation_fact_id(entity)], steps=[], depends_on=[],
+        )
+
+    if status == "CLEAR":
+        return Evidence(entity_id=eid, status=status, kind="NONE", rank=None)
+
+    if status == "BLOCKED":
+        rank = blocked_rank[eid]
+        eligible = [
+            _ownership_step(owner, info, blocked)
+            for owner, info in edges_in
+            if owner in blocked and blocked_rank.get(owner, float("inf")) < rank
+        ]
+        eligible.sort(key=lambda s: (-s.stake_range[0], s.owner_id, min(s.source_fact_ids)))
+        steps = _take_prefix_until_50(eligible, bound_index=0)
+        return Evidence(
+            entity_id=eid, status=status, kind="OWNERSHIP", rank=rank,
+            fact_ids=[], steps=steps, depends_on=[s.owner_id for s in steps],
+        )
+
+    # AMBIGUOUS
+    rank = possible_rank[eid]
+    eligible_ownership = []
+    for owner, info in edges_in:
+        if owner in blocked:
+            eligible_ownership.append(_ownership_step(owner, info, blocked))
+        elif owner in possible and possible_rank.get(owner, float("inf")) < rank:
+            eligible_ownership.append(_ownership_step(owner, info, blocked))
+
+    if sum(s.stake_range[1] for s in eligible_ownership) >= 50:
+        eligible_ownership.sort(key=lambda s: (-s.stake_range[1], s.owner_id, min(s.source_fact_ids)))
+        steps = _take_prefix_until_50(eligible_ownership, bound_index=1)
+        return Evidence(
+            entity_id=eid, status=status, kind="OWNERSHIP", rank=rank,
+            fact_ids=[], steps=steps, depends_on=[s.owner_id for s in steps],
+        )
+
+    eligible_links = [
+        (partner_id, link) for partner_id, link in identity_links
+        if partner_id in blocked
+        or (partner_id in possible and possible_rank.get(partner_id, float("inf")) < rank)
+    ]
+    eligible_links.sort(key=lambda pl: identity_link_fact_id(pl[1]))
+    partner_id, link = eligible_links[0]
+    step = EvidenceStep(
+        owner_id=partner_id,
+        owner_status="BLOCKED" if partner_id in blocked else "AMBIGUOUS",
+        stake_range=None,
+        uncertainty_kind=None,
+        source_fact_ids=[identity_link_fact_id(link)],
+    )
+    return Evidence(
+        entity_id=eid, status=status, kind="IDENTITY_LINK", rank=rank,
+        fact_ids=[], steps=[step], depends_on=[partner_id],
+    )
 
 
 def propagate_blocked(
@@ -235,11 +469,18 @@ def propagate_blocked(
         identity_neighbors[link.entity_id].add(link.same_as_id)
         identity_neighbors[link.same_as_id].add(link.entity_id)
 
+    # Same, but keeping the link object for its fact ID (§9.2 evidence).
+    identity_links_by_entity = defaultdict(list)
+    for link in active_identity:
+        identity_links_by_entity[link.entity_id].append((link.same_as_id, link))
+        identity_links_by_entity[link.same_as_id].append((link.entity_id, link))
+
     # --- §5 seed ---
     blocked = {
         eid for eid, e in entities_by_id.items()
         if e.designated and _active(e.designation_start, e.designation_end, as_of_date)
     }
+    designated_seed = set(blocked)  # captured before the loop mutates `blocked` (§9.2.2)
     possible = set()
 
     # --- §5 fixed-point loop ---
@@ -277,6 +518,12 @@ def propagate_blocked(
                 ):
                     possible.add(eid)
                     changed = True
+
+    # --- §9.2.2 synchronous justification ranks (evidence only; independent
+    # of the async loop above, see _synchronous_ranks()) ---
+    blocked_rank, possible_rank = _synchronous_ranks(
+        ids, designated_seed, incoming, identity_neighbors
+    )
 
     # --- §9 output, computed from the final blocked/possible sets ---
     results = {}
@@ -341,11 +588,17 @@ def propagate_blocked(
         if total_lower_all > 100:
             reason_codes.add("OWNERSHIP_OVER_100")
 
+        evidence = _build_evidence(
+            eid, e, status, designated_active, edges_in,
+            identity_links_by_entity.get(eid, []),
+            blocked, possible, blocked_rank, possible_rank,
+        )
+
         results[eid] = OwnershipResult(
             status=status,
             blocked_owner_sum=(min(100, lower_sum), min(100, upper_sum_blocked)),
             possible_owner_sum=min(100, upper_sum_possible),
-            evidence_paths=[],
+            evidence=evidence,
             control_links=controlling_links,
             effective_ownership={},
             reason_codes=sorted(reason_codes),
