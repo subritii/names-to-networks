@@ -152,6 +152,243 @@ project's reasoning. `CLAUDE.md` was out of date, not the repo. Updated `CLAUDE.
 binding" section and "Docs and decisions" section to state both are tracked and public by design, and
 removed the incorrect git-ignored/local-only claims. No change to `.gitignore` or repo history.
 
+## 2026-09-23 — `propagate_blocked()` implemented: reason-code attribution not pinned down by §6/§9
+
+Implemented the algorithm itself (statuses, §4.4 combination, the §5 fixed-point loop, §5.2 capped
+sums), leaving `evidence_paths` and `effective_ownership` as empty placeholders per scope. All 40 tests
+in `tests/test_ownership_examples.py` and `tests/test_ownership_properties.py` pass unmodified.
+
+§9 lists eleven reason codes but only five are pinned down by a worked example
+(`UNKNOWN_STAKE`, `STAKE_CONFLICT`, `CONTROL_ONLY_LINK`, `LOW_CONFIDENCE_LINK`, `OWNERSHIP_OVER_100`).
+For the rest, made the following defensible-but-unverified choices:
+
+- **`OWNED_BY_BLOCKED`**: added whenever an entity's blocked-owner `lower_sum >= 50` (i.e. the ownership
+  cascade path fired), independent of whether the entity is also independently `DESIGNATED`.
+- **`AGGREGATE_OWNERSHIP`**: added alongside `OWNED_BY_BLOCKED` only when *more than one* blocked owner's
+  combined edge contributed to `lower_sum` (row 5's "blocked owners' stakes are summed" pattern) — a
+  single blocked owner reaching 50% alone does not get this code.
+- **`BAND_UNCERTAINTY`** vs. **`AMBIGUOUS_OWNER`**: both only ever added when the entity's final status is
+  AMBIGUOUS, attributed per contributing edge — `BAND_UNCERTAINTY` when a *blocked* owner's combined edge
+  is a known band (`lower < upper`); `AMBIGUOUS_OWNER` when the contributing owner is itself only
+  AMBIGUOUS (not BLOCKED). This distinguishes row 6-style banded-stake ambiguity from row 10-style
+  ambiguity-propagated-through-an-ambiguous-owner, since both produce AMBIGUOUS but for different reasons.
+- **`START_DATE_INFERRED`**: added whenever any active combined edge into the entity has
+  `start_date_inferred=True` on any contributing source edge, regardless of status.
+- **Same-source duplicate edges**: §4.4 is worded as "two or more active edges ... from different
+  sources," but doesn't say what happens if the same source reports two active edges for one pair. Applied
+  the same intersection/hull combination regardless of whether sources differ, since it's the natural
+  generalization and doesn't conflict with anything the spec states.
+
+None of this changes any settled §3–§8 rule or any worked-example outcome — it only fills in reason-code
+detail the spec's worked-examples table doesn't exercise. Flagging here per the ownership-rules skill's
+"record decisions" rule rather than treating it as settled.
+
+## 2026-09-23 — §9.1 reason-code trigger conditions promoted from decisions.md into the spec, with two corrections
+
+The reason-code attribution choices logged in the previous entry ("`propagate_blocked()` implemented:
+reason-code attribution not pinned down by §6/§9") were promoted into `ownership_rules.md` as explicit,
+settled rules (v0.7, new §9.1 and a §4.4 addition), at the user's direction, with two corrections to what
+`src/screen/ownership.py` actually did:
+
+1. **`AGGREGATE_OWNERSHIP`** was previously set whenever *more than one* blocked owner had a contributing
+   edge, regardless of whether one of them already reached 50% alone. Corrected: it now requires that
+   *no single* blocked owner's combined `stake_lower` reaches 50 alone — a dominant blocked owner plus an
+   incidental smaller one no longer gets flagged as an aggregate case.
+2. **`BAND_UNCERTAINTY`** was previously set whenever a blocked owner's combined edge had
+   `stake_lower < stake_upper`, known — which also fires on a hull-combined (`STAKE_CONFLICT`) edge, since
+   a hull is a `[min, max]` range and thus almost always has `lower < upper` too. Corrected: added an
+   explicit `uncertainty kind` classification per combined edge (§4.4: `conflict` > `unknown` > `band` >
+   `none`, mutually exclusive), and `BAND_UNCERTAINTY` now requires kind `band` specifically, never
+   `conflict` or `unknown`.
+
+Also specified in the spec (previously implementation-only): `DESIGNATED` fires exactly when the entity
+itself is designated and active at `as_of_date`; the same-source duplicate-edge combination rule (§4.4
+applies to any 2+ active edges on a pair, not only cross-source ones).
+
+`src/screen/ownership.py` updated to match §9.1 exactly (the `AGGREGATE_OWNERSHIP` and `BAND_UNCERTAINTY`
+fixes above); `tests/test_ownership_reason_codes.py` added — one positive test per reason code, three
+negative tests (single dominant blocked owner → no `AGGREGATE_OWNERSHIP`; unknown stake → no
+`BAND_UNCERTAINTY`; hull conflict → no `BAND_UNCERTAINTY`), and a property test that `BAND_UNCERTAINTY`/
+`AMBIGUOUS_OWNER` only ever appear on AMBIGUOUS entities and `OWNED_BY_BLOCKED`/`AGGREGATE_OWNERSHIP` only
+on BLOCKED ones. All of `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`, and the
+new file pass together; no existing test file was modified.
+
+## 2026-09-23 — §4.4 `unknown` uncertainty-kind condition fixed; worked-example rows 27-28 added
+
+The v0.7 uncertainty-kind classification (previous entry) still had a bug in `unknown`'s condition, both
+in the spec text and in `_uncertainty_kind()`: it fired whenever the *combined* edge's `stake_known` was
+`False`, which — via the old `known = all(e.stake_known for e in edges)` combination logic — is true
+whenever *any* contributing source is unknown, even if another source is a known band or exact stake that
+fully determines the (narrower) intersection. Concretely: D→X reported as unknown `[0, 100]` by one source
+and Band A `[25, 50]` by another intersects to `[25, 50]` — a real band, not an unconstrained unknown — but
+the old code labeled it `unknown` and emitted `UNKNOWN_STAKE` instead of `BAND_UNCERTAINTY`.
+
+Decision, at the user's direction: `unknown` now requires that **every** contributing source edge is
+itself unknown — an unknown source contributes nothing once intersected with any known source, since
+`[0, 100]` cannot narrow anything. Restated in `ownership_rules.md` §4.4 (v0.8) as kind reflecting the
+*resulting range*, not which sources fed it: `none` (point value) is checked first — so intersecting
+unknown with an exact stake is `none`, not `unknown`, even though it involved an unknown source — then
+`unknown` (only if all sources unknown), then `band` (the residual case, which for this spec's finite
+exact/PSC-band/unknown stake model always exactly equals one known contributing source's own range).
+
+`_uncertainty_kind()` in `src/screen/ownership.py` now takes the contributing `edges` list directly
+(rather than a pre-reduced `known` boolean) so it can check `all(not e.stake_known for e in edges)`
+itself. Added worked-example rows 27 (`unknown` + Band A → `[25, 50]`, `band`, not `unknown`) and 28
+(`unknown` + exact 40% → `[40, 40]`, `none`) to §6.2, and corresponding tests
+`test_row_27_unknown_and_band_overlap_is_band_not_unknown` /
+`test_row_28_unknown_and_exact_overlap_is_none` in `tests/test_ownership_reason_codes.py`. Row 28 can't
+expose a reason-code symptom of the old bug directly (the entity ends up CLEAR under either the old or new
+kind, since `BAND_UNCERTAINTY`/`UNKNOWN_STAKE` only ever apply to AMBIGUOUS entities) — it's kept as a
+documented spec row for the combination result itself, consistent with the row-18 precedent
+(documentation-only rows are allowed when the algorithm's public output can't distinguish the two cases).
+Verified the fix actually mattered by replaying the old `_uncertainty_kind()` logic standalone against
+row 27's inputs (`unknown` vs. the correct `band`) rather than by reverting the real file. All 58 tests
+in `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`, and
+`tests/test_ownership_reason_codes.py` pass; no existing test file was modified.
+
+## 2026-09-23 — Three test-infrastructure fixes to `tests/test_ownership_properties.py`, at the user's direction
+
+Unlike other entries in this log, these are changes to the property-test file itself, not to
+`ownership.py` or the spec. The ownership-rules skill's "never edit the ownership tests to make code
+pass" rule is about the assistant unilaterally weakening tests to get an implementation to pass; it
+doesn't bar the user from directing test-infrastructure improvements, which is what these are — no
+property's assertions changed, and no implementation behavior changed.
+
+1. **`_record_outcome_events()` now called in every test that computes a result**, not just five of
+   thirteen. Changed its signature to `_record_outcome_events(entities, edges, result)` (added `edges`,
+   needed for item 2 below) and added a call at every `_run(...)` call site, including properties 11, 12,
+   13 (previously missing) and 1, 3, 4, 5, 7, 8 (also previously missing). Property 5 uses the separate
+   `graphs_single_controlled_designation()` strategy, so its calls pass `graph.entities`/
+   `graph.ownership_edges` from that strategy's own `Graph`, not the general `graphs()` one.
+
+2. **New outcome event `outcome:blocked_via_cascade`**: a non-designated entity is BLOCKED and at least
+   one owner with an active edge into it is itself BLOCKED and non-designated — the multi-hop cascade
+   pattern from `ownership_rules.md` §6.1 (the §3 trap example), as opposed to blocking that traces
+   directly back to a single designated owner. Implemented as `_has_cascade()`, checking active
+   `(owner_id, owned_id)` pairs for this owner/owned-both-BLOCKED-and-non-designated pattern.
+
+   Biased `graphs()` to construct this pattern explicitly and often: with `len(ids) >= 3`, a 60% chance
+   picks three distinct ids `D`/`A`/`B`, forces `D` designated-and-active, forces `A` and `B`
+   non-designated (overriding the per-entity `_entity()` draw's independent ~50%-designated coin flip,
+   which was otherwise defeating the pattern most of the time — see below), and adds `D`→`A` and `A`→`B`
+   exact 60% edges, each independently guaranteed active via `_active_now()`.
+
+   First attempt used a plain 50%-probability boolean gate and only forced `D`'s designation, leaving `A`
+   and `B` to whatever the earlier per-entity draw assigned — checked via
+   `--hypothesis-show-statistics` and found only 3.70% of examples firing the event, far under the 20%
+   target. Root cause: `_entity()` independently designates every drawn id ~50% of the time, so `A` or
+   `B` ended up designated (and thus excluded from `_has_cascade()`'s non-designated check) about 75% of
+   the time the chain was constructed at all. Fixing that (forcing `A`/`B` non-designated) alone brought
+   most tests into the 15–37% range; bumping the construction probability from 50% to 60% brought every
+   `graphs()`-based property test to 27–50%. `test_property_5` (2.44%) and `test_property_7` (0%, not
+   shown by `--hypothesis-show-statistics`) are expected exceptions: property 5 doesn't use `graphs()` at
+   all, and property 7's own strategy (`graphs_no_designations()`) strips every designation by
+   construction, so the pattern can never fire there — that's the property being tested, not a gap.
+
+3. **`_distinct_pair()` no longer uses `.filter(lambda t: t[0] != t[1])`.** Rewrote it to draw the first
+   id, remove it from the candidate list, then draw the second id from what's left — functionally
+   identical (still a uniformly-chosen ordered pair of distinct ids from `ids`, which always has at least
+   2 elements) but avoids Hypothesis's filter-and-retry machinery. Left the one other `.filter(...)`
+   pair-draw in `graphs_single_controlled_designation()` (inside `_risk_increase`'s "extra edges" loop)
+   unchanged — its filter also excludes a specific `(d_id, owned)` pair, not just self-pairs, so it isn't
+   the same pattern the user asked to remove.
+
+All 61 tests in `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`, and
+`tests/test_ownership_reason_codes.py` pass after these changes.
+
+## 2026-09-23 — Monotonicity branch events; property 5's actual invalid-example source fixed (not the date)
+
+Two more fixes to `tests/test_ownership_properties.py`, at the user's direction:
+
+1. **`_risk_increase()` now records `event(f"mono:{kind}")`** for each of its four branches
+   (`designate`/`edge_from_blocked`/`identity_link_to_blocked`/`raise_bounds`), plus `event("mono:noop")`
+   on the no-op fallback (`if not kinds: return graph`) — gives per-branch coverage evidence for
+   `test_property_1_monotonicity` the same way `_record_structural_events`/`_record_outcome_events`
+   already do elsewhere.
+
+2. **Property 5's invalid-example count investigated and fixed — but not where the instruction pointed.**
+   The user described it as "generating and rejecting ... for the date condition," asking for the query
+   date to be generated as `designation_start` minus a positive offset. Checked first: the test already
+   does exactly that (`d = s - timedelta(days=data.draw(st.integers(min_value=1, max_value=1000)))`,
+   unconditional, no `assume`/`filter` involved) — this was already correct and needed no change. The
+   actual, sole source of `test_property_5_time_consistency_designation`'s 128 invalid examples (checked
+   via `--hypothesis-show-statistics`, which named the exact filter in every "invalid" line) was a
+   different filter entirely: `graphs_single_controlled_designation()`'s "extra edges" loop excluded both
+   self-pairs and the specific `(d_id, owned)` pair via
+   `.filter(lambda t: t[0] != t[1] and (t[0], t[1]) != (d_id, owned))`, which rejects most of the sample
+   space when `ids` is short (e.g. only 1 of 4 possible tuples is valid when `len(ids) == 2`) — this is
+   the same `.filter(lambda t: t[0] != t[1])`-style pair draw fixed elsewhere in this file in an earlier
+   entry, left alone at the time because of its extra exclusion condition.
+
+   Fixed by drawing `owner` first, then computing the excluded set (`{owner}`, or `{owner, owned}` when
+   `owner == d_id`) and drawing `target` from `ids` with that set removed, skipping the edge entirely on
+   the rare occasion (`len(ids) == 2` and `owner == d_id`) that leaves no valid target — never raising and
+   never retrying. This took the invalid count from 128 to 34 (out of 200, `dev` profile).
+
+   The remaining 34 are not filter-related: `--hypothesis-show-statistics` shows no named reason for them
+   (unlike the removed filter, which named itself in every "invalid" line), and a from-scratch, filter-free
+   `st.data()`-based property test in the same file (`test_property_3_order_independence`, which never
+   touches this strategy) shows a comparable 21 invalid examples of its own. This is baseline overhead
+   inherent to `@given(data=st.data())`'s interactive `.draw()` style, not something under this strategy's
+   control — restructuring away from `st.data()` would be a larger change than asked for here.
+
+All 61 tests pass, including a full run on the `ci` Hypothesis profile
+(`HYPOTHESIS_PROFILE=ci pytest tests/ -q`, 1000 examples per property test).
+
+## 2026-09-24 — Four spec-check findings addressed (spec first, then tests, then code)
+
+Follow-up to the `/spec-check ownership_rules` review (fresh-context subagent against the diff and the
+spec). Spec updated to v0.9. All four items below: spec change → new test (shown failing against the
+pre-fix code) → code fix. `tests/test_ownership_examples.py` and `tests/test_ownership_properties.py`
+were not touched; new tests went into `tests/test_ownership_reason_codes.py`, which this session owns.
+
+1. **`control_links` was never populated (real gap, not a documented scope decision).**
+   `propagate_blocked()` computed `active_control` and used it for the `CONTROL_ONLY_LINK` reason code,
+   but always returned `control_links=[]`. Unlike `evidence_paths`/`effective_ownership`, this was never
+   scoped as deferred anywhere. §9's `control_links` row and §9.1's `CONTROL_ONLY_LINK` row now state the
+   same explicit filter: an active `ControlEdge` counts only when its controller (`owner_id`) is BLOCKED
+   or AMBIGUOUS in the final `blocked`/`possible` sets — a control edge from a CLEAR controller produces
+   neither the reason code nor a `control_links` entry. This is a real behavior change to
+   `CONTROL_ONLY_LINK` (previously fired for *any* active control edge regardless of controller status);
+   row 17 was updated to note it now also asserts `control_links` content, and a new row 32 covers the
+   CLEAR-controller case. Code: `control_links` is now built from the same `controlling_links` list that
+   sets the reason code, instead of a hardcoded `[]`.
+
+2. **§4.4 boundary-touching ranges: numeric touch is not always a true overlap.** Two source ranges whose
+   *stored* plain-number bounds meet at exactly one point (e.g. Band A's stored upper `50` and Band B's
+   stored lower `50`) were always treated as overlapping (intersection = that point), because combination
+   only ever compared stored numbers, never each source's true open/closed bound from §4.2's band table.
+   Concretely: Band A `(25, 50]` + Band B `(50, 75)` touch at `50` in stored form, but `50` is *excluded*
+   from Band B's true range (open lower bound) — genuinely no shared stake percentage exists there, so
+   this should be a conflict (hull `[25, 75]`, `STAKE_CONFLICT`), not a pinned `[50, 50]`. Added a new
+   `_true_bounds()`/`_point_truly_shared()` pair to `src/screen/ownership.py`: for the degenerate case
+   where the numeric intersection collapses to a single point, that point counts as a true overlap only
+   if it lies inside *every* contributing source's own range under that source's true (not stored) bound.
+   A genuine sub-range intersection (`inter_lower < inter_upper`) is untouched — always a true overlap,
+   since interior points don't depend on endpoint openness. Spec gained the §4.2-band-table-based
+   boundary rule in §4.4 and worked-example rows 29–31 (Band A + Band B → conflict; exact 25% + Band A →
+   conflict, since 25 is Band A's open lower bound; exact 50% + Band A → true overlap, since 50 is Band
+   A's closed upper bound).
+
+3. **§9.1 `AGGREGATE_OWNERSHIP` now states explicitly that it presupposes `OWNED_BY_BLOCKED`.** The prior
+   wording ("no single blocked owner reaches 50 alone") was, read in isolation, vacuously satisfiable for
+   an entity BLOCKED solely via its own designation with no qualifying incoming edge. The code already
+   only sets `AGGREGATE_OWNERSHIP` nested inside the `lower_sum >= 50` branch that also sets
+   `OWNED_BY_BLOCKED` (`src/screen/ownership.py`), so no code change was needed here — just closing the
+   spec-wording gap the review found.
+
+4. **§7: a null start date is now a validation error, not silent inactivity.** `_active()` previously
+   returned `False` for a `None` start (treating the fact as simply not-yet-active). §7 already required
+   ingestion to backfill any missing start date before propagation ever runs; reaching `propagate_blocked()`
+   with a null start is a data-integrity bug, not a legitimate "inactive" edge, and silently dropping it
+   risked masking real defects as a quiet CLEAR result. `_active()` now raises `ValueError` on a null
+   start, and this applies uniformly to `OwnershipEdge`/`ControlEdge` start dates and to an
+   active-designation check (`designated=True` with no `designation_start`), since all three route through
+   the same `_active()` call. Added `test_null_start_date_raises_validation_error`.
+
+All 70 tests pass, including a full run on the `ci` Hypothesis profile
+(`HYPOTHESIS_PROFILE=ci pytest tests/ -q`, 1000 examples per property test).
+
 ## 2026-09-23 — `IdentityLinkEdge` gets a `first_seen_date`, filtered like any other edge
 
 Spec change (v0.4) to `ownership_rules.md` §2, at the user's direction: `IdentityLinkEdge` now carries a

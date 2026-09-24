@@ -23,3 +23,5 @@ data/snapshots/
 # IDE
 .vscode/
 .idea/
+.hypothesis/
+.pytest_cache/

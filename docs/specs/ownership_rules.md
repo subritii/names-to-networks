@@ -1,7 +1,7 @@
 # Ownership & Blocking Rules
 
-**Status:** complete (v0.6: added §5.2 — reported sums capped at 100, new `OWNERSHIP_OVER_100` reason code; v0.5: §11 item 1 scoped monotonicity to the combined edge after §4.4 conflict resolution; v0.4: `IdentityLinkEdge` made symmetric and given a `first_seen_date` with half-open time validity; v0.3: identity-link ambiguity path added, per `entity_linking.md` §2.4)
-**Governs:** `src/screen/ownership.py` (`propagate_blocked()`), `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`
+**Status:** complete (v0.9: `control_links`/`CONTROL_ONLY_LINK` now filtered to controllers that are BLOCKED or AMBIGUOUS (§9, §9.1); §4.4 gained the boundary-touching true-open/closed-bounds rule (§4.2's band table) for ranges whose stored numbers meet at exactly one point, with worked-example rows 29–31; row 32 added for a CLEAR-controller control edge; §9.1's `AGGREGATE_OWNERSHIP` now states explicitly that it presupposes `OWNED_BY_BLOCKED`; §7 now requires `propagate_blocked()` to raise a validation error on a null start date rather than treat it as inactive; v0.8: fixed §4.4's `unknown` uncertainty-kind condition — an overlap-combined edge is `unknown` only if *every* contributing source is unknown, not merely one; added worked-example rows 27–28; v0.7: added §9.1 explicit reason-code trigger conditions, §4.4 uncertainty-kind classification (`band`/`unknown`/`conflict`/`none`) and the same-source duplicate-edge rule; v0.6: added §5.2 — reported sums capped at 100, new `OWNERSHIP_OVER_100` reason code; v0.5: §11 item 1 scoped monotonicity to the combined edge after §4.4 conflict resolution; v0.4: `IdentityLinkEdge` made symmetric and given a `first_seen_date` with half-open time validity; v0.3: identity-link ambiguity path added, per `entity_linking.md` §2.4)
+**Governs:** `src/screen/ownership.py` (`propagate_blocked()`), `tests/test_ownership_examples.py`, `tests/test_ownership_properties.py`, `tests/test_ownership_reason_codes.py`
 
 ## 1. Purpose
 
@@ -65,6 +65,36 @@ If two or more active edges exist for the same `owner_id` → `owned_id` pair fr
 
 - If their ranges **overlap**, use the **intersection** (the range both sources allow). Example: exact 40% and Band A `(25, 50]` → `[40, 40]`.
 - If their ranges **do not overlap**, use the **hull** (the smallest range containing both) and add reason code `STAKE_CONFLICT`. Example: 30% and 60% → `[30, 60]`, which produces AMBIGUOUS if the owner is blocked.
+
+This combination rule applies to any two or more active edges sharing an `owner_id` → `owned_id` pair, not only edges from different sources. If a single source itself reports two active edges for the same pair, combine them the same way.
+
+**Boundary-touching ranges.** Two ranges whose *stored* numbers meet at exactly one point (e.g. Band A's stored upper bound `50` and Band B's stored lower bound `50`) do not automatically count as overlapping. §4.2's bound convention stores only plain numbers — openness is not tracked in `stake_lower`/`stake_upper` themselves — so combination must look up each contributing source's **true** openness at that boundary from §4.2's band table before deciding overlap:
+
+| Source shape | True lower bound | True upper bound |
+|---|---|---|
+| Exact (`stake_lower == stake_upper`) | closed | closed |
+| Unknown (`stake_known = False`) | closed | closed |
+| Band A `(25, 50]` | open | closed |
+| Band B `(50, 75)` | open | open |
+| Band C `[75, 100]` | closed | closed |
+
+The shared point is a true overlap only if it falls inside **every** contributing source's own range under that source's true bounds. If any contributing source's own bound at that point is open, the sources are treated as **not** overlapping — hull, `STAKE_CONFLICT` — even though their stored numbers touch. (This check only matters when the numeric intersection collapses to a single point; a genuine sub-range intersection, where `inter_lower < inter_upper`, is always a true overlap regardless of any endpoint's openness, since every interior point is included no matter how the endpoints are bounded.)
+
+Examples (§6.2 rows 29–31):
+- Band A `[25, 50]` + Band B `[50, 75]`: stored ranges touch at `50`, but `50` is open in Band B's true range `(50, 75)` → not a true overlap → hull `[25, 75]`, `STAKE_CONFLICT`.
+- Exact `25` + Band A `[25, 50]`: stored ranges touch at `25`, but `25` is open in Band A's true range `(25, 50]` → not a true overlap → hull `[25, 50]`, `STAKE_CONFLICT`.
+- Exact `50` + Band A `[25, 50]`: stored ranges touch at `50`, and `50` is closed (included) in Band A's true range `(25, 50]` → a true overlap → pinned `[50, 50]`.
+
+**Uncertainty kind.** After combination, each `owner_id` → `owned_id` pair's single combined edge carries exactly one uncertainty kind, used by §9.1's reason-code conditions. The kind reflects the **resulting range**, not which sources fed it:
+
+| Kind | Condition |
+|---|---|
+| `conflict` | The hull was used (the source ranges did not overlap) |
+| `none` | Not `conflict`, and the combined `stake_lower == stake_upper` (a pinned single value) — including when this point value was only reached by intersecting an unknown source (`[0, 100]`) with an exact source, e.g. row 28 |
+| `unknown` | Not `conflict` or `none`, and **every** contributing source edge is unknown (`stake_known = False`). An unknown source intersected with any known source (band or exact) is *not* `unknown` — the known source's own range applies, since intersecting with `[0, 100]` cannot narrow it further (row 27) |
+| `band` | Not `conflict`, `none`, or `unknown` — i.e. at least one contributing source is known, and the combined range is not a single point. For this spec's finite stake model (exact / Band A / Band B / Band C / unknown), this case's combined range always exactly equals one contributing known source's own range |
+
+Kinds are mutually exclusive and checked in the order above, so a hull-combined edge is always `conflict`, never also `band` — even though a hull's range is necessarily at least as wide as either source's own range. Likewise, an edge combined from an unknown source and a band source is `band`, never `unknown` — unknown only describes a combined edge where *no* source narrowed the range at all.
 
 ### 4.5 Ignored edges
 
@@ -178,7 +208,7 @@ A is designated. A owns 60% of B. B owns 50% of C.
 | 14 | D owns 60% of A; A owns 60% of B; B owns 60% of A | A, B: BLOCKED; terminates | Cycle safety |
 | 15 | D owns 60% of A, edge starts 2025-01-01; as_of 2024-12-31 | A: CLEAR | Edge not yet active |
 | 16 | D designated 2026-03-01, delisted 2026-06-01; D owns 60% of A; as_of 2026-06-01 | A: CLEAR | Half-open end (§7) |
-| 17 | D has a control-only PSC entry for X, no shares | X: CLEAR, `CONTROL_ONLY_LINK` | Control is out of scope (§10) |
+| 17 | D is designated and has a control-only PSC entry for X, no shares | X: CLEAR, `CONTROL_ONLY_LINK`; `control_links` contains the D→X control edge | Control is out of scope for status (§10), but D (the controller) is BLOCKED, so this control edge is reportable evidence (§9, §9.1) |
 | 18 | D's UK PSC record for X reports a stake of exactly 25% or below (no band assigned) | No edge; X: CLEAR | Below PSC reporting threshold (§4.2) — this rule applies only to PSC-band-sourced data, not to exact-stake data from other sources (contrast row 5, where an exact 25% stake from a non-PSC source does get an edge) |
 | 19 | E has an `IdentityLinkEdge` to D, first seen before `as_of_date` (designated, so D is in `blocked`); E has no ownership edges at all | E: AMBIGUOUS, `LOW_CONFIDENCE_LINK` | Identity path (§5.1); works for persons with no ownership edges, not just companies |
 | 20 | E has an `IdentityLinkEdge` to X, first seen before `as_of_date`, where X is AMBIGUOUS (not BLOCKED) via a Band A ownership edge from a blocked owner | E: AMBIGUOUS | Identity path checks `blocked ∪ possible`, consistent with the ownership path's own `blocked ∪ possible` reachability test |
@@ -188,6 +218,12 @@ A is designated. A owns 60% of B. B owns 50% of C.
 | 24 | As row 19, but the `IdentityLinkEdge` is stored with `entity_id = D`, `same_as_id = E` (fields reversed) | Same as row 19: E: AMBIGUOUS, `LOW_CONFIDENCE_LINK` | The edge is symmetric (§2, §5.1); which field holds which id is not meaningful |
 | 25 | As row 19, but the `IdentityLinkEdge`'s `first_seen_date` is after `as_of_date` | E: CLEAR | The link is not yet active at `as_of_date` (§7 half-open filtering applies to `IdentityLinkEdge` too) |
 | 26 | D1 and D2 are both designated; D1 owns 70% of X, D2 owns 80% of X | X: BLOCKED, `OWNERSHIP_OVER_100`; `blocked_owner_sum = (100, 100)`, `possible_owner_sum = 100` | Uncapped `lower_sum = 150 >= 50` decides BLOCKED (§5); the raw total across both owners (150) exceeds 100, so `OWNERSHIP_OVER_100` is flagged (§5.2), but every *reported* sum is capped at 100 |
+| 27 | D designated; two sources for D→X: one unknown (`[0, 100]`), one Band A (`[25, 50]`) | X: AMBIGUOUS, `BAND_UNCERTAINTY`, not `UNKNOWN_STAKE` | Overlapping ranges → intersection `[25, 50]` (§4.4) — the unknown source's `[0, 100]` contributes nothing once intersected with the known band, so the combined edge's uncertainty kind is `band`, not `unknown`, even though one contributing source was itself unknown |
+| 28 | D designated; two sources for D→X: one unknown (`[0, 100]`), one exact 40% | X: CLEAR | Overlapping ranges → intersection `[40, 40]` (§4.4); the combined edge's uncertainty kind is `none` (a pinned single value), not `unknown` — 40 < 50 so X is CLEAR, and neither `UNKNOWN_STAKE` nor `BAND_UNCERTAINTY` would apply if it were AMBIGUOUS |
+| 29 | D designated; two sources for D→X: Band A (stored `[25, 50]`) and Band B (stored `[50, 75]`) | X: AMBIGUOUS, `STAKE_CONFLICT` | Stored ranges touch at 50, but 50 is open in Band B's true range `(50, 75)` — not a true overlap; hull `[25, 75]` (§4.4) |
+| 30 | D designated; two sources for D→X: exact 25% and Band A (stored `[25, 50]`) | X: AMBIGUOUS, `STAKE_CONFLICT` | Stored ranges touch at 25, but 25 is open in Band A's true range `(25, 50]` — not a true overlap; hull `[25, 50]` |
+| 31 | D designated; two sources for D→X: exact 50% and Band A (stored `[25, 50]`) | X: BLOCKED | Stored ranges touch at 50, and 50 is closed (included) in Band A's true range `(25, 50]` — a true overlap; pinned `[50, 50]` |
+| 32 | C is not designated (CLEAR) and has a control-only PSC entry for X, no shares | X: CLEAR; no `CONTROL_ONLY_LINK`; `control_links` is empty | The controller (C) is CLEAR, not BLOCKED or AMBIGUOUS, so the control edge produces neither the reason code nor a `control_links` entry (§9, §9.1) — contrast row 17, where the controller is BLOCKED |
 
 ## 7. Time awareness: half-open validity intervals
 
@@ -200,7 +236,7 @@ s <= d              # if e is null (open-ended / ongoing)
 
 Use half-open `[start, end)` semantics uniformly. An edge that ends on `e` is *not* active on `e` itself, which avoids double-counting at transition dates.
 
-**Missing start dates.** If a source gives no start date, use the record's **first-seen date in the source snapshot** and set `start_date_inferred = True` (reason code `START_DATE_INFERRED`).
+**Missing start dates.** If a source gives no start date, use the record's **first-seen date in the source snapshot** and set `start_date_inferred = True` (reason code `START_DATE_INFERRED`). This backfill is ingestion's responsibility, applied before a fact ever reaches `propagate_blocked()` — the algorithm itself never receives a null start date for a valid fact. If `propagate_blocked()` is called with any `OwnershipEdge`, `ControlEdge`, or active (`designated = True`) `Entity` whose start date is `None`, that is a data-integrity error, not an inactive fact: `propagate_blocked()` must raise a validation error rather than silently treating it as inactive.
 
 **Time consistency.** `propagate_blocked(as_of_date=d)` must first filter edges and designations to those active at `d`, then run propagation fresh on that filtered snapshot. For any designation with `designation_start = s`, a query with `d < s` must never return BLOCKED or AMBIGUOUS because of that designation, for it or anything downstream. Never cache or reuse `blocked` or `possible` sets computed at one date for a query at a different date.
 
@@ -222,12 +258,32 @@ This number is a **risk feature and explanation field only** (e.g. "high effecti
 | `blocked_owner_sum` | `(lower_sum, upper_sum_blocked)` from blocked owners only (§5), each component capped at 100 for reporting (§5.2) |
 | `possible_owner_sum` | `upper_sum` from blocked and ambiguous owners, capped at 100 (§5, §5.2) |
 | `evidence_paths` | For BLOCKED: each chain of blocked owners back to a designated entity, with stake range, source, and dates on every edge. For AMBIGUOUS: the chains that make the threshold reachable, plus any `IdentityLinkEdge` and the status of its target, for identity-linked ambiguity (§5.1). |
-| `control_links` | Control-only relationships to blocked or ambiguous entities (evidence only) |
+| `control_links` | Active `ControlEdge`s into the entity whose controller (`owner_id`) is BLOCKED or AMBIGUOUS in the final `blocked`/`possible` sets (evidence only) — same filter as reason code `CONTROL_ONLY_LINK` (§9.1); a control edge from a CLEAR controller produces no entry here |
 | `effective_ownership` | Feature from §8, per designated root |
 | `reason_codes` | See below |
 | `as_of_date` | The query date |
 
-**Reason codes:** `DESIGNATED`, `OWNED_BY_BLOCKED`, `AGGREGATE_OWNERSHIP`, `BAND_UNCERTAINTY`, `UNKNOWN_STAKE`, `AMBIGUOUS_OWNER`, `STAKE_CONFLICT`, `START_DATE_INFERRED`, `CONTROL_ONLY_LINK`, `LOW_CONFIDENCE_LINK`, `OWNERSHIP_OVER_100`.
+**Reason codes:** `DESIGNATED`, `OWNED_BY_BLOCKED`, `AGGREGATE_OWNERSHIP`, `BAND_UNCERTAINTY`, `UNKNOWN_STAKE`, `AMBIGUOUS_OWNER`, `STAKE_CONFLICT`, `START_DATE_INFERRED`, `CONTROL_ONLY_LINK`, `LOW_CONFIDENCE_LINK`, `OWNERSHIP_OVER_100`. Trigger conditions for each are given in §9.1.
+
+### 9.1 Reason code trigger conditions
+
+Each entity's `reason_codes` is the union of every condition below that holds for it, evaluated against the **final** `blocked`/`possible` sets (after §5's fixed point) and the combined edges into that entity (§4.4). More than one code can apply to the same entity.
+
+| Code | Trigger |
+|---|---|
+| `DESIGNATED` | The entity itself is designated and its designation is active at `as_of_date` (§7). |
+| `OWNED_BY_BLOCKED` | The entity's blocked-owner `lower_sum >= 50` (§5) — i.e. it is BLOCKED via the ownership cascade, independent of whether it is also independently `DESIGNATED`. |
+| `AGGREGATE_OWNERSHIP` | `OWNED_BY_BLOCKED` also applies (this code presupposes it — the entity is BLOCKED via `lower_sum >= 50` from ownership, not solely via its own designation), **and** no single blocked owner's own combined `stake_lower` reaches 50 alone — i.e. summing multiple blocked owners' stakes was necessary to cross the threshold (§6.2 row 5). Never set for an entity BLOCKED solely via its own designation with no incoming ownership edge reaching the threshold, and never set when one blocked owner's stake alone is `>= 50`, even if other, smaller blocked owners also hold edges into the same entity. |
+| `BAND_UNCERTAINTY` | The entity is AMBIGUOUS, and at least one combined edge from a **blocked** owner has uncertainty kind `band` (§4.4). Never set from an `unknown` or `conflict` edge, even though both can also have `stake_lower < stake_upper`. |
+| `UNKNOWN_STAKE` | The entity is AMBIGUOUS, and at least one combined edge from a **blocked** owner has uncertainty kind `unknown` (§4.4). |
+| `AMBIGUOUS_OWNER` | The entity is AMBIGUOUS, and at least one contributing owner is itself AMBIGUOUS (not BLOCKED) — ambiguity propagated downstream via an already-ambiguous owner (§5.1 rule 3, row 10). |
+| `STAKE_CONFLICT` | At least one combined edge into the entity has uncertainty kind `conflict` (§4.4), regardless of status or of the owner's own status. |
+| `START_DATE_INFERRED` | At least one active edge into the entity has `start_date_inferred = True` (§7), regardless of status. |
+| `CONTROL_ONLY_LINK` | At least one active `ControlEdge` into the entity exists (§4.5, §10) whose controller (`owner_id`) is BLOCKED or AMBIGUOUS in the final `blocked`/`possible` sets — the same filter that populates `control_links` (§9). A control edge from a CLEAR controller triggers neither this code nor a `control_links` entry. |
+| `LOW_CONFIDENCE_LINK` | The entity is AMBIGUOUS, and it has an active `IdentityLinkEdge` (§5.1) to an entity in `blocked ∪ possible`. |
+| `OWNERSHIP_OVER_100` | The uncapped sum of `stake_lower` across **all** active combined edges into the entity, regardless of owner status, exceeds 100 (§5.2). |
+
+`BAND_UNCERTAINTY`, `UNKNOWN_STAKE`, and `STAKE_CONFLICT` are mutually exclusive **per edge** (an edge's uncertainty kind is exactly one of `band`/`unknown`/`conflict`/`none`, §4.4), but a single entity can still carry more than one of these codes if it has multiple incoming edges of different kinds.
 
 ## 10. Non-goals (out of scope for this version)
 

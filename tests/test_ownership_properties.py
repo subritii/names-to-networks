@@ -105,11 +105,10 @@ def _stake_kind(edge):
 
 
 def _distinct_pair(draw, ids):
-    return draw(
-        st.tuples(st.sampled_from(ids), st.sampled_from(ids)).filter(
-            lambda t: t[0] != t[1]
-        )
-    )
+    first = draw(st.sampled_from(ids))
+    remaining = [i for i in ids if i != first]
+    second = draw(st.sampled_from(remaining))
+    return first, second
 
 
 def _ownership_edge(draw, owner, owned, as_of, source=None, stake=None):
@@ -165,6 +164,40 @@ def graphs(draw, as_of=AS_OF, force=frozenset()):
             owner = cyc_ids[i]
             owned = cyc_ids[(i + 1) % len(cyc_ids)]
             edges.append(_ownership_edge(draw, owner, owned, as_of))
+
+    # Occasional explicit cascade chain: D (forced designated) -> A -> B,
+    # both stakes >= 50, so a non-designated owner (A) itself becomes
+    # BLOCKED via D and then blocks a further non-designated entity (B) --
+    # the multi-hop cascade pattern from ownership_rules.md §6.1. Makes
+    # "outcome:blocked_via_cascade" common across a run, not merely
+    # incidental to the other random edge draws (docs/decisions.md, 2026-09-23).
+    if len(ids) >= 3 and draw(st.integers(min_value=0, max_value=9)) < 6:
+        d_id, a_id, b_id = draw(
+            st.lists(st.sampled_from(ids), min_size=3, max_size=3, unique=True)
+        )
+        d_start, d_end = _active_now(draw, as_of)
+
+        def _cascade_entity(e):
+            # A and B must stay non-designated -- the earlier per-entity
+            # `_entity()` draw randomly designates every id (~50% each),
+            # which would otherwise defeat _has_cascade()'s non-designated
+            # requirement on the owner/owned pair most of the time.
+            if e.id == d_id:
+                return replace(e, designated=True, designation_start=d_start, designation_end=d_end)
+            if e.id in (a_id, b_id):
+                return replace(e, designated=False, designation_start=None, designation_end=None)
+            return e
+
+        entities = [_cascade_entity(e) for e in entities]
+        for owner, owned in ((d_id, a_id), (a_id, b_id)):
+            start, end = _active_now(draw, as_of)
+            edges.append(
+                OwnershipEdge(
+                    owner_id=owner, owned_id=owned, stake_lower=60, stake_upper=60,
+                    stake_known=True, source=draw(st.sampled_from(SOURCES)),
+                    start_date=start, end_date=end,
+                )
+            )
 
     # One edge per stake kind, each independently ~50%, so all three PSC
     # bands, exact, and unknown stakes show up densely across a run rather
@@ -246,11 +279,16 @@ def graphs_single_controlled_designation(draw, as_of=AS_OF):
         )
     ]
     for _ in range(draw(st.integers(min_value=0, max_value=4))):
-        owner, target = draw(
-            st.tuples(st.sampled_from(ids), st.sampled_from(ids)).filter(
-                lambda t: t[0] != t[1] and (t[0], t[1]) != (d_id, owned)
-            )
-        )
+        owner = draw(st.sampled_from(ids))
+        # Exclude self-pairs, and specifically (d_id, owned) -- other random
+        # edges must never touch that pair, or they could change its
+        # combined range via a §4.4 multi-source combination and break the
+        # guaranteed D->owned result this strategy exists to isolate.
+        excluded = {owner, owned} if owner == d_id else {owner}
+        candidates = [i for i in ids if i not in excluded]
+        if not candidates:
+            continue
+        target = draw(st.sampled_from(candidates))
         edges.append(_ownership_edge(draw, owner, target, as_of))
 
     return Graph(entities, edges, [], [], as_of), s, owned
@@ -316,9 +354,11 @@ def _risk_increase(draw, graph):
         kinds.append("raise_bounds")
 
     if not kinds:
+        event("mono:noop")
         return graph
 
     kind = draw(st.sampled_from(kinds))
+    event(f"mono:{kind}")
 
     if kind == "designate":
         target = draw(st.sampled_from(undesignated))
@@ -436,7 +476,31 @@ def _record_structural_events(graph):
         event("boundary_date")
 
 
-def _record_outcome_events(entities, result):
+def _has_cascade(entities, edges, result):
+    """A non-designated entity is BLOCKED and at least one owner with an
+    active edge into it is itself BLOCKED and non-designated -- i.e. its
+    blocked status was reached through at least one intermediate owner,
+    not directly from a designation (ownership_rules.md §6.1, the §3 trap
+    example).
+    """
+    designated_ids = {e.id for e in entities if e.designated}
+    pairs = {(e.owner_id, e.owned_id) for e in edges}
+    for owner_id, owned_id in pairs:
+        owned_result = result.get(owned_id)
+        owner_result = result.get(owner_id)
+        if owned_result is None or owner_result is None:
+            continue
+        if (
+            owned_result.status == "BLOCKED"
+            and owned_id not in designated_ids
+            and owner_result.status == "BLOCKED"
+            and owner_id not in designated_ids
+        ):
+            return True
+    return False
+
+
+def _record_outcome_events(entities, edges, result):
     statuses = {r.status for r in result.values()}
     if "AMBIGUOUS" in statuses:
         event("outcome:ambiguous_present")
@@ -448,6 +512,8 @@ def _record_outcome_events(entities, result):
         event("outcome:identity_link_fires")
     if any("OWNERSHIP_OVER_100" in r.reason_codes for r in result.values()):
         event("outcome:ownership_over_100")
+    if _has_cascade(entities, edges, result):
+        event("outcome:blocked_via_cascade")
 
 
 def _run(graph):
@@ -471,6 +537,8 @@ def test_property_1_monotonicity(data):
 
     before = _run(graph)
     after = _run(modified)
+    _record_outcome_events(graph.entities, graph.ownership_edges, before)
+    _record_outcome_events(modified.entities, modified.ownership_edges, after)
 
     for eid in {e.id for e in graph.entities}:
         assert STATUS_ORDER[after[eid].status] >= STATUS_ORDER[before[eid].status]
@@ -480,7 +548,7 @@ def test_property_1_monotonicity(data):
 def test_property_2_range_validity(graph):
     _record_structural_events(graph)
     result = _run(graph)
-    _record_outcome_events(graph.entities, result)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result)
 
     for r in result.values():
         blocked_lower, blocked_upper = r.blocked_owner_sum
@@ -502,6 +570,7 @@ def test_property_3_order_independence(data):
 
     result_a = _run(graph)
     result_b = _run(shuffled)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_a)
 
     for eid in {e.id for e in graph.entities}:
         assert result_a[eid].status == result_b[eid].status
@@ -512,6 +581,7 @@ def test_property_3_order_independence(data):
 def test_property_4_cycle_safety(graph):
     _record_structural_events(graph)
     result = _run(graph)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result)
     assert set(result.keys()) == {e.id for e in graph.entities}
 
 
@@ -521,10 +591,12 @@ def test_property_5_time_consistency_designation(data):
     d = s - timedelta(days=data.draw(st.integers(min_value=1, max_value=1000)))
 
     result_before = _run(replace(graph, as_of_date=d))
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_before)
     for r in result_before.values():
         assert r.status == "CLEAR"
 
     result_active = _run(replace(graph, as_of_date=s))
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_active)
     d_id = graph.entities[0].id
     assert result_active[d_id].status == "BLOCKED"
     assert result_active[owned].status == "BLOCKED"
@@ -534,7 +606,7 @@ def test_property_5_time_consistency_designation(data):
 def test_property_6_designated_are_blocked(graph):
     _record_structural_events(graph)
     result = _run(graph)
-    _record_outcome_events(graph.entities, result)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result)
 
     for e in graph.entities:
         if e.designated and e.designation_start <= graph.as_of_date and (
@@ -546,6 +618,7 @@ def test_property_6_designated_are_blocked(graph):
 @given(graph=graphs_no_designations())
 def test_property_7_no_designations_no_risk(graph):
     result = _run(graph)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result)
     for r in result.values():
         assert r.status == "CLEAR"
 
@@ -554,6 +627,7 @@ def test_property_7_no_designations_no_risk(graph):
 def test_property_8_idempotence(graph):
     result_a = _run(graph)
     result_b = _run(graph)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_a)
     for eid in {e.id for e in graph.entities}:
         assert result_a[eid].status == result_b[eid].status
 
@@ -562,11 +636,12 @@ def test_property_8_idempotence(graph):
 def test_property_9_only_blocked_owners_confirm(graph):
     _record_structural_events(graph)
     result_before = _run(graph)
-    _record_outcome_events(graph.entities, result_before)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_before)
 
     ambiguous_ids = {eid for eid, r in result_before.items() if r.status == "AMBIGUOUS"}
     filtered_edges = [e for e in graph.ownership_edges if e.owner_id not in ambiguous_ids]
     result_after = _run(replace(graph, ownership_edges=filtered_edges))
+    _record_outcome_events(graph.entities, filtered_edges, result_after)
 
     for eid, r in result_before.items():
         if r.status == "BLOCKED":
@@ -577,7 +652,7 @@ def test_property_9_only_blocked_owners_confirm(graph):
 def test_property_10_identity_linked_ambiguity(graph):
     _record_structural_events(graph)
     result = _run(graph)
-    _record_outcome_events(graph.entities, result)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result)
 
     for link in graph.identity_link_edges:
         if link.first_seen_date > graph.as_of_date:
@@ -600,6 +675,8 @@ def test_property_11_identity_link_symmetry(graph):
         for link in graph.identity_link_edges
     ]
     result_after = _run(replace(graph, identity_link_edges=swapped_links))
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_before)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_after)
 
     for eid in {e.id for e in graph.entities}:
         assert result_before[eid].status == result_after[eid].status
@@ -622,11 +699,13 @@ def test_property_12_no_effect_identity_links(graph):
     with_link = replace(graph, entities=entities, identity_link_edges=graph.identity_link_edges + [no_effect_link])
 
     result_with = _run(with_link)
+    _record_outcome_events(entities, graph.ownership_edges, result_with)
     assert result_with[iso_a].status == "CLEAR"
     assert result_with[iso_b].status == "CLEAR"
 
     without_link = replace(with_link, identity_link_edges=graph.identity_link_edges)
     result_without = _run(without_link)
+    _record_outcome_events(entities, graph.ownership_edges, result_without)
 
     for eid in {e.id for e in entities}:
         assert result_with[eid].status == result_without[eid].status
@@ -637,9 +716,11 @@ def test_property_13_general_time_consistency(graph):
     _record_structural_events(graph)
     d = graph.as_of_date
     result_before = _run(graph)
+    _record_outcome_events(graph.entities, graph.ownership_edges, result_before)
 
     stripped = _strip_future_facts(graph, d)
     result_after = _run(stripped)
+    _record_outcome_events(stripped.entities, stripped.ownership_edges, result_after)
 
     for eid in {e.id for e in graph.entities}:
         assert result_before[eid].status == result_after[eid].status
